@@ -1,44 +1,39 @@
 /* ************************************************************************
-PatchMapper.c
-A tool to identify and map contiguous patches in a raster image, and perform
-	certain other analyses on the patches in that image
+PatchMapper.c  version 0.92 Kurt Riitters March 2024
+A tool to identify and map patches (contiguous pixels of the same type) in a byte-value raster image,
+	and perform certain other analyses on the patches in that image
 TO DO:
-1. get rid of parameter m for missing. Missing is hardwired as zero in some places, and it doesn't
-matter because re-coding is possible, so there's no reason to have a parameter for missing values,
-only a requirement that missing MUST be zero, by recode if necessary.
-2. check into parallelizing patch definer.
 3. add file writes for basic pixel and patch stats that are now spewed to the terminal.
-
+4. check windows compilation data types
 
 Compilation: 
-gcc -std=c99 -m64 -Wall -fopenmp PatchMapper.c -o patchmapper  -O2 -lm
+gcc -std=c99 -m64 -Wall -fopenmp patchmapper.c -o patchmapper  -O2 -lm
+(on windows, suggest using -D__USE_MINGW_ANSI_STDIO)
 
-Usage notes
+Usage notes (See PatchMapperGuide for details)
 Missing values:
-	should be zero on the input dataset, or recoded to zero via parameters.recode=1
-	after any re-coding, will be set to 'internal' code 255 in {main}.
-	
+	Must be zero on the input dataset; pixels can be recoded to zero via parameter Z with a recode.txt file.
 Required files:
 	size.txt
-	inputmap
+	inputmap   
 	parfile.txt
 Optional files:
-	recode.txt	If parameter Z = 1; a lookup table for re-coding input pixel values. One line per change. Format <old code><space><new code>
+	recode.txt	If parameter Z = 1; a lookup table for re-coding input pixel values.
 Output files:
-	If parameter X = 1; patchmap - an image containing sequential patch numbers from 1...to N total patches
-	If parameter P = 1; patchstatistics.csv - a text file with info about each patch:
-		If parameter N = 4 (4-neighbor)
-			Patch_number,Patch_type,Num_pixels,Out_edges,In_edges,Out_pixels,Row_origin,Col_origin,Touch_border,Row_max,Col_min,Colmax
-		If parameter N = 8 (8-neighbor)
-			Patch_number,Patch_type,Num_pixels,Row_origin,Col_origin,Row_max,Col_min,Colmax
-		
-Parameter file format, each line has a letter (case insensitive) and a paramter value separated by spaces
-m	0	pixel value representing missing value (after re-coding if parameter Z = 1; default=0)
+	patchmap  If parameter X = 1; an image containing sequential patch numbers. 
+	patchstatistics1.csv   If parameter P = 1; a text file with basic info about each patch:
+		Patch_number,Patch_type,Num_pixels,Row_origin,Col_origin,Row_max,Col_min,Col_max
+	patchstatistics2.csv   If parameter E = 1, AND parameter N = 4 (not available for 8-neighbor rule),
+		a text file with patch perimeter info for each patch:
+		Patch_number,Out_edges,In_edges,Out_pixels,Touch_flag
+Parameter file format, each line has a letter (case insensitive) and a parameter value separated by spaces
 z	0	re-code input pixels? (0=no; 1=yes; default = 0)
 n	4	neighbor rule (either 4 or 8; default = 4)
 x	0	output patch map? (0=no; 1=yes; default = 0)
-p   0	calculate and export patch-level statistics? (0=no, 1=yes)
-	
+p   0	calculate and export basic patch-level statistics? (0=no, 1=yes; default = 0)
+e	0	calculate and export patch perimeter statistics? (0=no, 1=yes; default = 0)
+
+
 Misc notes.
 	Here is the magic to access a 1-D array of size rows*columns using [row][col] syntax.
 		Example. for unsigned char *mat_in of size rxc, and want to access as Matrix_1[r][c], declare
@@ -48,6 +43,13 @@ Misc notes.
 		Reference: https://stackoverflow.com/questions/32317605/treating-one-dimensional-array-as-two-dimensional-at-run-time
 
 Changelog
+Version 0.92  March 2024
+Removed m (missing) parameter; missing values assumed to be zero after any re-coding.
+Added OMP parallel for loops in several places.
+Separated Patch_Analyzer into two routines:
+	Patch_Analyzer_1, for both 4- and 8-neighbor, to store patch type, size, row/col origin, rmax, cmin, cmax
+	Patch_Analyzer_4neighbor, for 4-neighbor ONLY, to store patch type and perimeter info
+	
 Version 0.91  February 2024
 Added the accumulation and text export of individual patch statistics (size, class, location of patch origin)
 Version 0.9 October 2021
@@ -76,22 +78,20 @@ void Find_Neighbors(unsigned int, unsigned int, unsigned int, unsigned int, unsi
 void Add_Queue(unsigned int, unsigned int);
 int Read_Parameter_File(FILE *);
 int Pixel_Analyzer(unsigned int, unsigned int) ;
-void Patch_Analyzer_4neighbor(unsigned int, unsigned int); 
-void Patch_Analyzer_8neighbor(unsigned int, unsigned int); 
+void Patch_Analyzer_4neighbor(unsigned int, unsigned int); // aka perimeter_analyzer, only for 4 neighbors
+void Patch_Analyzer_1(unsigned int, unsigned int); // basic patch stats
 
 // make some things visible everywhere 
 unsigned char *mat_in;
-unsigned int *mat_patnum;
+unsigned int *mat_patnum;		// sequential patch numbers start at 1 and are in the range [1, matrix_stats.Num_patches] (maximum 4294967295]
 unsigned char *mat_util;
-unsigned int *edge_matrix;
 // run or control parameters
 struct options  {              	// Holds run-time requests or default values  
-	 int Missing_input;        	// 'Missing' data code value used in the input data matrix 
 	 int Rows;                  // number of rows and columns as found in the data set 
 	 int Cols;
 }; 
 struct options control =
-   {0, 0, 0};    /* Defaults */ 
+   {0, 0};    /* Defaults */ 
 
 struct queue_1 {					// holds a linked-list queue 
     unsigned int Row;			// the row and column of an entry define a pixel in the queue 
@@ -101,13 +101,13 @@ struct queue_1 {					// holds a linked-list queue
 struct queue_1 *first_ptr;			// pointer to first element in the queue, Add_Queue expects this be declared in common  
 
 struct run_parameters {
-	int missing_value_code;   	//after recode, if any 
-	int recode;       		  	// 0 = no recode, 1 = recode, supply recode values in recode file
-	int neighbor_rule;			// either 4 or 8 
-	int write_patch_map;		// 0=no, 1=yes 
-	int patch_analyzer;			// 0=no, 1=yes
+	int recode;       		  	// 0 = no recode, 1 = recode (must supply recode values in recode.txt file)
+	int neighbor_rule;			// 4 (default) or 8 
+	int write_patch_map;		// 0=no (default), 1=yes 
+	int patch_analyzer;			// 0=no (default), 1=yes
+	int perimeter_analyzer;		// 0=no (default), 1=yes
 };                              // Default parameter values 
-struct run_parameters parameters = {0,0,4,0,0};
+struct run_parameters parameters = {0,4,0,0,0};
 
 // overall image statistics
  struct statistics_1 {
@@ -123,9 +123,22 @@ struct run_parameters parameters = {0,0,4,0,0};
 struct statistics_1 matrix_stats =  
      { 0,0,{0.},{0},0,{0},{0.},0.}; 
 
-// patch statistics, The patches are numbered from 1...N total patches. A reduced set is available for 8-neighbor
+// First set of patch statistics, The patches are numbered from 1...N total patches.
 struct statistics_2 {             
     unsigned char Patch_type; 	// The internal type of this patch, 0 - 254 
+	unsigned int Num_pixels;    // Number of pixels in patch       
+	unsigned int Row_org;       // Starting row of this patch. By def == rmin.   Note that cell Row_org, Col_org is guaranteed to be in a given patch   
+	unsigned int Col_org;       // Starting column of this patch   
+	unsigned int Row_max;       // Max row where this patch occurs. (Row_min is == Row_org) 
+	unsigned int Col_min;       // Min column where this patch occurs. 
+	unsigned int Col_max;       // Max column where this patch occurs.
+}; 
+struct statistics_2 *patch_stats1;
+
+// Second set of patch statistics, with perimeter info. The patches are numbered from 1...N total patches.
+//  To minimize changes from original code, this structure duplicates the row_org, col_org, and Num_pixels that were
+//	already found and stored, then deleted, in patch_stats1
+struct statistics_3 {             
 	unsigned int Num_pixels;    // Number of pixels in patch       
 	unsigned int Out_edges;     // Number of outside edges, ie. perimeter 
 	unsigned int In_edges;      // Number of inside edges                   
@@ -133,21 +146,18 @@ struct statistics_2 {
 	unsigned int Row_org;       // Starting row of this patch   Note that cell Row_org, Col_org is guaranteed to be in a given patch   
 	unsigned int Col_org;       // Starting column of this patch   
 	unsigned char Touch_border;	// 1 if patch touches border OR a missing value. This is called "touch_flag" on csv output
-	unsigned int Row_max;       // Max row where this patch occurs. (Row_min is == Row_org) 
-	unsigned int Col_min;       // Min column where this patch occurs. 
-	unsigned int Col_max;       // Max column where this patch occurs.
 }; 
-struct statistics_2 *patch_stats;   
-
+struct statistics_3 *patch_stats2;
+// ------------
 int main(int argc, char **argv)
 {
-	static int row, col, nrows, ncols, index, ret_val, vold, vnew;
-	static int dumint, ind1, counter, recode_table[256], temp_int;
-	static int Out_to_in[256];      // Array(x) = internal code for external code x 
-	static int In_to_out[256];      // Array(x) = external code for internal code x 
-	char filename_in[100], filename_siz[100], filename_par[100], 
-		 filename_rec[100], filename_pat[100],header_line[30], filename_patstats[100];
-	FILE *infile, *sizfile, *parfile, *recfile, *patfile, *patstatsfile;
+	unsigned int row, col, nrows, ncols, index, ret_val, vold, vnew;
+	unsigned int dumint, ind1, counter, recode_table[256], temp_int;
+	unsigned int Out_to_in[256];      // Array(x) = internal code for external code x 
+	unsigned int In_to_out[256];      // Array(x) = external code for internal code x 
+	char filename_in[100], filename_siz[100], filename_par[100], filename_rec[100], 
+		 filename_pat[100],header_line[30], filename_patstats1[100], filename_patstats2[100];
+	FILE *infile, *sizfile, *parfile, *recfile, *patfile, *patstatsfile1, *patstatsfile2;
 //			/* as needed ... windows and linux are different
 			printf("\nMake sure an int is 4 bytes");
 			index = sizeof(char);
@@ -169,7 +179,8 @@ int main(int argc, char **argv)
 	strcpy(filename_rec, "recode.txt");
 	strcpy(filename_par, "parfile.txt");
 	strcpy(filename_pat, "patchmap");
-	strcpy(filename_patstats, "patchstatistics.csv");
+	strcpy(filename_patstats1, "patchstatistics1.csv");
+	strcpy(filename_patstats2, "patchstatistics2.csv");
 	setbuf(stdout, NULL);
 	// Open some files 
 	if( (infile = fopen(filename_in, "rb") ) == NULL){printf("\nError opening %s\n", filename_in);exit(15);}
@@ -180,8 +191,8 @@ int main(int argc, char **argv)
 		fclose(infile);fclose(sizfile);exit(19);
 	}
 	fclose(parfile);
-	printf("\nParameters: m %d  z %d  n %d  x %d p %d", parameters.missing_value_code, parameters.recode, parameters.neighbor_rule,
-		parameters.write_patch_map,  parameters.patch_analyzer);
+	printf("\nParameters: z %d  n %d  x %d p %d e %d", parameters.recode, parameters.neighbor_rule,
+		parameters.write_patch_map,  parameters.patch_analyzer, parameters.perimeter_analyzer);
 	// Read the siz file and save nrows and ncols in control structure
 	if(fscanf(sizfile,"%s %d", header_line, &nrows) != 2) {printf("\nError reading size file"); exit(18);}
 	if(fscanf(sizfile,"%s %d", header_line, &ncols) != 2) {printf("\nError reading size file"); exit(18);}
@@ -209,17 +220,16 @@ int main(int argc, char **argv)
 			recode_table[index] = index; 
 		}
 		printf("\nRe-coding input map");
-		printf("\n   Old code ---> New code\n");
+		printf("\n   Old code ---> New code");
 		while(fscanf(recfile, "%d %d", &vold, &vnew) == 2) {
 			recode_table[vold] = vnew;
-			printf("   %8d ---> %3d\n", vold, vnew);
+			printf("\n   %8d ---> %3d", vold, vnew);
 		}
 		fclose(recfile);
 // OMP the recode		
-#pragma omp parallel  for  	 private ( row, index)		
+#pragma omp parallel  for  	 private ( row, index, col, dumint)		
 		for (row=0; row < nrows; row++) {
 			index = row * ncols;
-#pragma omp parallel  for  	 private ( col, dumint)
 			for (col=0; col < ncols; col++) {
 				dumint = *(mat_in + index + col);
 				*(mat_in + index + col) = recode_table[dumint];
@@ -253,18 +263,22 @@ int main(int argc, char **argv)
 	// Set the number of non-missing types found in the matrix 
 	matrix_stats.Num_types = counter + 1;
 	printf("\nNumber of non-missing types: %d", matrix_stats.Num_types);
-	printf("\nInternal and External codes:");
+	printf("\nInternal and external codes:");
+	if(parameters.recode == 1) {
+		printf("\n(External codes are after re-coding)");
+	}
 	for(ind1 = 0; ind1 < matrix_stats.Num_types; ind1++) {
 			printf("\n%4d %4d", ind1, In_to_out[ind1]);
 	}
-	printf("\n 255 %4d", In_to_out[255]);
+	printf("\n 255 %4d (missing value)", In_to_out[255]);
 	//basic pixel statistics 
 	printf("\nGetting basic pixel statistics");
 	if( (ret_val = Pixel_Analyzer(nrows, ncols)) != 0){
 		printf("\nError in Pixel Analyzer"); exit(31);
 	}
 	printf("\nNumber of non-missing pixels: %d", matrix_stats.Num_pixels);
-	printf("\npixel counts and percents by type:");
+	printf("\nPixel counts and percents by external type:");
+	printf("\nType     Pixels  Percent");
 	for(ind1 = 0; ind1 < matrix_stats.Num_types; ind1++) {
 			printf("\n%4d %10d  %7.5f", In_to_out[ind1], matrix_stats.Pix_counts [ind1], matrix_stats.Pix_percents [ind1]);
 	}
@@ -272,28 +286,24 @@ int main(int argc, char **argv)
 	printf("\nIdentifying patches with %d neighbor rule", parameters.neighbor_rule);
 	Patch_Definer(nrows, ncols);
 	// print n patches 
-	printf("\nNumber of patches by type:");
-	for (index = 0; index < 256; index++){
+	printf("\nNumber of patches by external type:");
+	printf("\nType     Number of patches");
+	for (index = 0; index < matrix_stats.Num_types; index++){
 		temp_int = matrix_stats.Num_type_patches[index];
-		if(temp_int > 0) {
-			printf("\n%4d  %10d", In_to_out[index], temp_int);
-		}
+		printf("\n%4d  %10d", In_to_out[index], temp_int);
 	}
 	printf("\nAll types: %d", matrix_stats.Num_patches);
-	//average patch sizes 
-	for (index = 0; index < 256; index++){
+	// average patch sizes 
+	for (index = 0; index < matrix_stats.Num_types; index++){
 		temp_int = matrix_stats.Num_type_patches[index];
-		if(temp_int > 0) {
-			matrix_stats.Average_patch_size [index] = (1.0*matrix_stats.Pix_counts [index])/(1.0*matrix_stats.Num_type_patches[index]);
-		}
+		matrix_stats.Average_patch_size [index] = (1.0*matrix_stats.Pix_counts [index])/(1.0*matrix_stats.Num_type_patches[index]);
 	}
 	matrix_stats.Average_patch_size_overall = (1.0* matrix_stats.Num_pixels)/(1.0*matrix_stats.Num_patches);
-	printf("\nAverage patch size by type:");
-	for (index = 0; index < 256; index++){
+	printf("\nAverage patch size by external type:");
+	printf("\nType     Average size");
+	for (index = 0; index < matrix_stats.Num_types; index++){
 		temp_int = matrix_stats.Num_type_patches[index];
-		if(temp_int > 0) {
-			printf("\n%4d  %10.2f", In_to_out[index],matrix_stats.Average_patch_size [index] );
-		}
+		printf("\n%4d  %10.2f", In_to_out[index],matrix_stats.Average_patch_size [index] );
 	}
 	printf("\nAll types: %10.2f", matrix_stats.Average_patch_size_overall);
 		// write patch map if requested
@@ -304,45 +314,62 @@ int main(int argc, char **argv)
 		if(fwrite(mat_patnum, 4, (nrows * ncols), patfile) != (ncols * nrows) ) {
 			printf("\nError writing patch number map file.\n");	exit(24);
 		}
+		fclose(patfile);
 	}
-	// call the routine to analyze each patch
+	// call the routine to analyze each patch: number, type, size, row/col origin, bounding box
 	if(parameters.patch_analyzer == 1) {
 		// Allocate the memory for the patch statistics to come.  Need to malloc one 
 		//   extra structure because the patches are indexed at base 1               
-		patch_stats = (struct statistics_2 *)calloc((matrix_stats.Num_patches + 1), sizeof(struct statistics_2)); 
-		if(patch_stats == NULL) {printf("\nError: Malloc failed in Patch_Analyzer\n");exit(8);} 
-		if( (patstatsfile = fopen(filename_patstats, "w") ) == NULL) {
-			printf("\nError opening %s\n", filename_patstats);exit(16);	
+		patch_stats1 = (struct statistics_2 *)calloc((matrix_stats.Num_patches + 1), sizeof(struct statistics_2)); 
+		if(patch_stats1 == NULL) {
+			printf("\nError: Malloc failed in Patch_Analyzer_1.");
+			printf("\nToo many patches. Unable to allocate 25 bytes of RAM for each of %d patches.", matrix_stats.Num_patches);
+			exit(8);
+		} 
+		if( (patstatsfile1 = fopen(filename_patstats1, "w") ) == NULL) {
+			printf("\nError opening %s\n", filename_patstats1);exit(16);	
 		}
-		printf("\nAnalyzing patches");
+		printf("\nAnalyzing patches: Patch type, size, origin, bounding box.");
+		Patch_Analyzer_1(nrows, ncols);
+		// write the patch stats file
+		printf("\nWriting patch statistics file");
+		fprintf(patstatsfile1, "Patch_number,Patch_type,Num_pixels,Row_org,Col_org,Row_max,Col_min,Col_max");
+		for(index = 1; index <= matrix_stats.Num_patches; index++) {
+			fprintf(patstatsfile1, "\n%d,%d,%d,%d,%d,%d,%d,%d", index, In_to_out[(*(patch_stats1+index)).Patch_type],
+				(*(patch_stats1+index)).Num_pixels, (*(patch_stats1+index)).Row_org, (*(patch_stats1+index)).Col_org,
+				(*(patch_stats1+index)).Row_max, (*(patch_stats1+index)).Col_min, (*(patch_stats1+index)).Col_max);
+				}
+		fclose(patstatsfile1);
+		free(patch_stats1);	
+	}
+	if(parameters.perimeter_analyzer == 1) {
 		if(parameters.neighbor_rule == 4) {
+			// Allocate the memory for the patch perimeter statistics to come.  Need to malloc one 
+			//   extra structure because the patches are indexed at base 1               
+			patch_stats2 = (struct statistics_3 *)calloc((matrix_stats.Num_patches + 1), sizeof(struct statistics_3)); 
+			if(patch_stats2 == NULL) {
+				printf("\nError: Malloc failed in Patch_Analyzer_2.");
+				printf("\nToo many patches. Unable to allocate 25 bytes of RAM for each of %d patches.", matrix_stats.Num_patches);
+				exit(8);
+			} 
+			if( (patstatsfile2 = fopen(filename_patstats2, "w") ) == NULL) {
+				printf("\nError opening %s\n", filename_patstats2);exit(16);	
+			}
+			printf("\nAnalyzing patch perimeters.");
 			Patch_Analyzer_4neighbor(nrows, ncols);
-			// write the patch stats file
-			printf("\nWriting patch statistics file");
-			fprintf(patstatsfile, "Patch_number,Patch_type,Num_pixels,Out_edges,In_edges,Out_pixels,Row_org,Col_org,Touch_flag,Row_max,Col_min,Col_max");
+			// write the patch perimeter stats file
+			printf("\nWriting patch perimeter statistics file");
+			fprintf(patstatsfile2, "Patch_number,Out_edges,In_edges,Out_pixels,Touch_flag");
 			for(index = 1; index <= matrix_stats.Num_patches; index++) {
-				fprintf(patstatsfile, "\n%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", index, In_to_out[(*(patch_stats+index)).Patch_type],
-					(*(patch_stats+index)).Num_pixels, (*(patch_stats+index)).Out_edges, (*(patch_stats+index)).In_edges,
-					(*(patch_stats+index)).Out_pixels, (*(patch_stats+index)).Row_org, (*(patch_stats+index)).Col_org,
-					(*(patch_stats+index)).Touch_border, (*(patch_stats+index)).Row_max, (*(patch_stats+index)).Col_min,
-					(*(patch_stats+index)).Col_max);
-				
+				fprintf(patstatsfile2, "\n%d,%d,%d,%d,%d", index, (*(patch_stats2+index)).Out_edges,
+				(*(patch_stats2+index)).In_edges, (*(patch_stats2+index)).Out_pixels, (*(patch_stats2+index)).Touch_border);
 			}
+			fclose(patstatsfile2);
+			free(patch_stats2);	
 		}
-		if(parameters.neighbor_rule == 8) {
-			Patch_Analyzer_8neighbor(nrows, ncols);
-			// write the patch stats file
-			printf("\nWriting patch statistics file");
-			fprintf(patstatsfile, "Patch_number,Patch_type,Num_pixels,Row_org,Col_org,Row_max,Col_min,Col_max");
-			for(index = 1; index <= matrix_stats.Num_patches; index++) {
-				fprintf(patstatsfile, "\n%d,%d,%d,%d,%d,%d,%d,%d", index, In_to_out[(*(patch_stats+index)).Patch_type],
-					(*(patch_stats+index)).Num_pixels, (*(patch_stats+index)).Row_org, (*(patch_stats+index)).Col_org,
-					(*(patch_stats+index)).Row_max, (*(patch_stats+index)).Col_min, (*(patch_stats+index)).Col_max);
-				
-			}
+		else {
+			printf("\nPerimeter analysis available only for 4-neighbor rule, skipping perimeter analysis.");
 		}
-		fclose(patstatsfile);
-		free(patch_stats);	
 	}
 	// clean up
 	free(mat_in);
@@ -373,6 +400,8 @@ void Patch_Definer(unsigned int nrows, unsigned int ncols)
 
 // Initialize Matrix_2 to patch number 0 
 // Initialize interior of Matrix_3 to NULL if it's not a missing pixel, or to X if it is a missing pixel 
+// OMP the initialization		
+#pragma omp parallel  for  	 private (r, c)		
 	for (r = 0; r < nrows; r++) { 
 		for (c = 0; c < ncols; c++) { 
 			Matrix_2 [r] [c] = 0; 
@@ -384,17 +413,23 @@ void Patch_Definer(unsigned int nrows, unsigned int ncols)
 			} 
 		} 
 	} 
-// Initialize one-pixel borders of Matrix_3   
+// Initialize one-pixel borders of Matrix_3  
+// OMP the initializations		
 	r = 0; 
+#pragma omp parallel  for  	 private (c)		
 	for(c = 0; c <= ncols + 1; c++) { 
-		Matrix_3 [r] [c] = 'X';} 
+		Matrix_3 [r] [c] = 'X';
+	} 
 	r = nrows + 1; 
+#pragma omp parallel  for  	 private (c)		
 	for(c = 0; c <= ncols + 1; c++) { 
 		Matrix_3 [r] [c] = 'X';} 
 	c = 0; 
+#pragma omp parallel  for  	 private (r)		
 	for(r = 0; r <= nrows + 1; r++) { 
 		Matrix_3 [r] [c] = 'X';} 
 	c = ncols + 1; 
+#pragma omp parallel  for  	 private (r)		
 	for(r = 0; r <= nrows + 1; r++) { 
 		Matrix_3 [r] [c] = 'X';} 
 // Find a member of a new patch   
@@ -422,10 +457,10 @@ void Patch_Definer(unsigned int nrows, unsigned int ncols)
 			// Find neighbors to this pixel, and clear this pixel  
 			Find_Neighbors(ncols, r, c, t1, patch_num); 
 			// Now iterate the neighbor function to clear this patch  
-			// Use the queue of neighbors to guide which pixels to clear 
+			// Use the dynamic queue of neighbors to guide which pixels to clear 
 			// Find_Neighbor will:
 			//	code patch members it finds as 'x' in Matrix_3
-			//	add these pixels into the queue
+			//	add these pixels into the queue 
 			//	code patch members it clears as 'X' in Matrix_3
 			//	assign patch numbers to Matrix_2  
 			current_ptr = first_ptr; 
@@ -447,7 +482,7 @@ return;
 /* Find_Neighbors(ncols, row, col, type, patch): 
 		Find and mark neighbors of pixel at (row, col) that are of
 		type "type", and mark them as patch number "patch"
-		The marks are made in Matrix_3 and then in a queue  
+		The marks are made in Matrix_3 and the neighbor pixels are added to the queue  
 		Then clear the pixel at (row, col)
 */ 
 void Find_Neighbors(unsigned int ncols, unsigned int row, unsigned int col, unsigned int type, unsigned int patch) 
@@ -467,7 +502,7 @@ void Find_Neighbors(unsigned int ncols, unsigned int row, unsigned int col, unsi
 		if(Matrix_1 [row - 1] [col] == type) {   // check its type  
 			Matrix_3 [o_row - 1] [o_col] = 'x';  // mark for later pass  
 			Matrix_2 [row - 1] [col] = patch;    // assign patch number 
-			Add_Queue( (row-1), col ); 
+			Add_Queue( (row-1), col ); 			// add the neighbor to the queue
 		} 
 	   } 
 	} 
@@ -576,10 +611,6 @@ int Read_Parameter_File(FILE *parfile)
 			flag = 0;
 			continue;
 		}
-		if((ch == 'm') || (ch == 'M')) {
-			parameters.missing_value_code = value;
-			continue;
-		}
 		if((ch == 'z') || (ch == 'Z')) {
 			parameters.recode = value;
 			continue;
@@ -596,6 +627,10 @@ int Read_Parameter_File(FILE *parfile)
 			parameters.patch_analyzer = value;
 			continue;
 		}
+		if((ch == 'e') || (ch == 'E')) {
+			parameters.perimeter_analyzer = value;
+			continue;
+		}
 		return(1);
 	}
 	if(value == 99) {
@@ -603,7 +638,7 @@ int Read_Parameter_File(FILE *parfile)
 	}
 	return(0);
 }
-/* Pixel_Analyzer: CALCULATE very basic PIXEL STATISTICS   ** 4-neighbor ONLY */ 
+/* Pixel_Analyzer: calculate very basic pixel statistics  */ 
 int Pixel_Analyzer(unsigned int nrows, unsigned int ncols) 
 {   unsigned int t, index;
 	unsigned int r, c;
@@ -620,6 +655,10 @@ int Pixel_Analyzer(unsigned int nrows, unsigned int ncols)
 	 // Reduce by the number of pixels of missing data  
 	 matrix_stats.Num_pixels =  matrix_stats.Num_pixels -  matrix_stats.Pix_counts [255]; 
 	// Calculate the percentages by type 
+	if(matrix_stats.Num_pixels == 0) {
+		printf("\nError: all pixels are missing... exiting");
+		return(1);
+	}		
 	for (t = 0; t < matrix_stats.Num_types; t++) { 
 		 matrix_stats.Pix_percents [t] = (1.0 * matrix_stats.Pix_counts [t] ) / (1.0 * matrix_stats.Num_pixels) ; 
 	} 
@@ -629,20 +668,20 @@ return(0);
 /* Patch_Analyzer_4neighbor:  */ 
 void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols) 
 { 
-	int p, r, c, test;               // local indices and flag 
-	int r1, c1;                      // temporary holders of row and col
-	int o_row, o_col;                // local indices for Matrix_3 
-	int r_org, c_org, r_max, c_max, r_min, c_min; 
-	int out_edge, out_pix, sum_in_edges, edge_temp;  // counters 
+	unsigned int p, r, c, test;               // local indices and flag 
+	unsigned int r1, c1;                      // temporary holders of row and col
+	unsigned int o_row, o_col;                // local indices for Matrix_3 
+	unsigned int r_org, c_org, r_max, c_max, r_min, c_min; 
+	unsigned int out_edge, out_pix, sum_in_edges, edge_temp;  // counters 
 	// the magic, see main 
-	unsigned char (*Matrix_1)[ncols] = (unsigned char (*)[ncols])mat_in;
+//	unsigned char (*Matrix_1)[ncols] = (unsigned char (*)[ncols])mat_in;
 	unsigned int (*Matrix_2)[ncols] = (unsigned int (*)[ncols])mat_patnum;
 	unsigned char (*Matrix_3)[ncols] = (unsigned char (*)[ncols])mat_util;
 	// Initialize variables that throw warnings
 	p=0; r=0; c = 0; r_org=0; c_org=0; c_max = 0; r_max=0; r_min=0; c_min=0; r1=0; c1=0;
 	// Initialize the (*(patch_stats + patch)).Num_pixels counter  
 	 for(p = 0; p <= matrix_stats.Num_patches; p++) { 
-		 (*(patch_stats + p)).Num_pixels = 0; 
+		 (*(patch_stats2 + p)).Num_pixels = 0; 
 	 } 
 	// Count the number of pixels in each patch, using patch number extracted 
 	//   from Matrix_2 as subscript.  Note that any missing cells have a 0  
@@ -650,7 +689,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 	//   for which the subscripts start at base 1.        
 	for(r = 0; r < control.Rows; r++) { 
 		for (c = 0; c < control.Cols; c++) { 
-			(*(patch_stats + Matrix_2 [r] [c] )).Num_pixels++; 
+			(*(patch_stats2 + Matrix_2 [r] [c] )).Num_pixels++; 
 		} 
 	} 
 	// The walkaround routine, counting edges per patch etc.      
@@ -664,13 +703,13 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
     for(p = 1; p <= matrix_stats.Num_patches; p++) { 
 		// Initialize some counters, statistics, and flags  
 		out_edge = 0; out_pix = 0;  sum_in_edges = 0; 
-		(*(patch_stats + p)).In_edges = 0; 
-		(*(patch_stats + p)).Touch_border = 0; 
+		(*(patch_stats2 + p)).In_edges = 0; 
+		(*(patch_stats2 + p)).Touch_border = 0; 
 		// Find the first member of patch p. For the first patch start at row 0. For subsequent
 		//		patches start at the row of the preceding patch -- patch (p-1).
 		//		Note that the row_org for patch p-1 will be set by the time patch p is checked.
 		if(p > 1) {
-			r = (*(patch_stats + p - 1)).Row_org; 
+			r = (*(patch_stats2 + p - 1)).Row_org; 
 		} 
 		else { // Use the first row for the first patch 
 			r = 0; 
@@ -683,9 +722,9 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 				else {
 					// The upper left pixel of patch p was found  
 					// Save the location and type  
-					(*(patch_stats + p)).Row_org = r;  // This is also Row_min 
-					(*(patch_stats + p)).Col_org = c; 
-					(*(patch_stats + p)).Patch_type = Matrix_1 [r] [c]; 
+					(*(patch_stats2 + p)).Row_org = r;  // This is also Row_min 
+					(*(patch_stats2 + p)).Col_org = c; 
+//					(*(patch_stats + p)).Patch_type = Matrix_1 [r] [c]; 
 					// Seed some values for later use in walkaround  
 					r_org = r; 
 					c_org = c; 
@@ -701,66 +740,66 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 		breakout: 
 		// If patch size is 1 or 2, the required statistics are easy and can skip   
 		//  the rest of this routine by using the following few statements   
-		if((*(patch_stats + p)).Num_pixels < 3)  { 
-			(*(patch_stats + p)).In_edges = 0; 
+		if((*(patch_stats2 + p)).Num_pixels < 3)  { 
+			(*(patch_stats2 + p)).In_edges = 0; 
 			// Handle the patch size = 1 case  
-			if((*(patch_stats + p)).Num_pixels == 1)  { 
-				(*(patch_stats + p)).Out_edges = 4; 
-				(*(patch_stats + p)).Out_pixels = 4; 
-				(*(patch_stats + p)).Row_max = (*(patch_stats + p)).Row_org; 
-				(*(patch_stats + p)).Col_max = (*(patch_stats + p)).Col_org; 
-				(*(patch_stats + p)).Col_min = (*(patch_stats + p)).Col_org; 
+			if((*(patch_stats2 + p)).Num_pixels == 1)  { 
+				(*(patch_stats2 + p)).Out_edges = 4; 
+				(*(patch_stats2 + p)).Out_pixels = 4; 
+//				(*(patch_stats + p)).Row_max = (*(patch_stats + p)).Row_org; 
+//				(*(patch_stats + p)).Col_max = (*(patch_stats + p)).Col_org; 
+//				(*(patch_stats + p)).Col_min = (*(patch_stats + p)).Col_org; 
 				// See if the patch touches the border 
 				if( r == 0 || r == (control.Rows - 1) || c == 0 ||  
 					c == (control.Cols - 1) ) {  
-					(*(patch_stats + p)).Touch_border = 1;  
+					(*(patch_stats2 + p)).Touch_border = 1;  
 				} 
 				else {
 					// See if the patch touches a missing value 
 					if (Matrix_2 [r-1] [c] == 0 || Matrix_2 [r+1] [c] == 0 || 
 						Matrix_2 [r] [c-1] == 0 || Matrix_2 [r] [c+1] == 0 ) { 
-							(*(patch_stats + p)).Touch_border = 1;  
+							(*(patch_stats2 + p)).Touch_border = 1;  
 					}
 				}
 			} 
 			// Handle the patch size = 2 case   
-			if((*(patch_stats + p)).Num_pixels == 2)  { 
-				(*(patch_stats + p)).Out_edges = 6; 
-				(*(patch_stats + p)).Out_pixels = 6; 
+			if((*(patch_stats2 + p)).Num_pixels == 2)  { 
+				(*(patch_stats2 + p)).Out_edges = 6; 
+				(*(patch_stats2 + p)).Out_pixels = 6; 
 				// See if the first pixel of the patch touches the border  
 				if( r == 0 || r == (control.Rows - 1) || c == 0 ||  
 					c == (control.Cols - 1) ) {  
-					(*(patch_stats + p)).Touch_border = 1;  
+					(*(patch_stats2 + p)).Touch_border = 1;  
 				}
 				else {
 					// See if the first pixel of the patch touches a missing value   
 					if (Matrix_2 [r-1] [c] == 0 || Matrix_2 [r+1] [c] == 0 || 
 						 Matrix_2 [r] [c-1] == 0 || Matrix_2 [r] [c+1] == 0 ) { 
-							(*(patch_stats + p)).Touch_border = 1;  
+							(*(patch_stats2 + p)).Touch_border = 1;  
 					}
 				}
 				// Now find the second pixel of the patch as r1 & c1  
 				// It can't be in a previous row, or in a previous column 
 				if(Matrix_2 [r+1] [c] == p) {   // check next row  
 					r1 = r+1; c1 = c;         	// temp save of location 
-					(*(patch_stats + p)).Row_max = r1; 
-					(*(patch_stats + p)).Col_max = c; 
+//					(*(patch_stats + p)).Row_max = r1; 
+//					(*(patch_stats + p)).Col_max = c; 
 				} 
 				if(Matrix_2 [r] [c+1] == p) {   // check next column 
 					r1 = r; c1 = c+1; 
-					(*(patch_stats + p)).Row_max = r; 
-					(*(patch_stats + p)).Col_max = c1; 
+//					(*(patch_stats + p)).Row_max = r; 
+//					(*(patch_stats + p)).Col_max = c1; 
 				} 
-				(*(patch_stats + p)).Col_min = c; 
+//				(*(patch_stats + p)).Col_min = c; 
 				// Repeat the border & missing touch tests for pixel #2 
 				if( r1 == 0 || r1 == (control.Rows - 1) || c1 == 0 ||  
 					c1 == (control.Cols - 1) ) {  
-					(*(patch_stats + p)).Touch_border = 1;  
+					(*(patch_stats2 + p)).Touch_border = 1;  
 				} 
 				else { 
 				   if (Matrix_2 [r1-1] [c1] == 0 || Matrix_2 [r1+1] [c1] == 0 || 
 					 Matrix_2 [r1] [c1-1] == 0 || Matrix_2 [r1] [c1+1] == 0 ) { 
-						(*(patch_stats + p)).Touch_border = 1;  
+						(*(patch_stats2 + p)).Touch_border = 1;  
 				   } 
 				} 
 			} // end of patch size 2 handling
@@ -794,7 +833,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 						} 
 						// if the cell above is missing, code Touch_border */ 
 						if(Matrix_2 [r-1] [c] == 0) { 
-							(*(patch_stats + p)).Touch_border = 1; 
+							(*(patch_stats2 + p)).Touch_border = 1; 
 						} 
 					} 
 				}
@@ -805,7 +844,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 					out_pix++; 
 					Matrix_3 [r] [c+1] = 'C'; 
 					// Note the patches that touch the matrix border  
-					(*(patch_stats + p)).Touch_border = 1; 
+					(*(patch_stats2 + p)).Touch_border = 1; 
 				} 
 				look_right: 
 				// ensure not the matrix right edge  
@@ -828,7 +867,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 						} 
 						// if the cell at right is missing, code touch_border 
 						if(Matrix_2 [r] [c+1] == 0) { 
-						   (*(patch_stats + p)).Touch_border = 1; 
+						   (*(patch_stats2 + p)).Touch_border = 1; 
 						} 
 					} 
 				} 
@@ -839,7 +878,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 					out_pix++; 
 					Matrix_3 [r+1] [c+2] = 'C'; 
 					// Note the patches that touch the matrix border 
-					(*(patch_stats + p)).Touch_border = 1; 
+					(*(patch_stats2 + p)).Touch_border = 1; 
 				} 
 				look_down: 
 				// ensure not the matrix bottom edge  
@@ -862,7 +901,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 						} 
 						// if the cell below is missing, code touch_border   
 						if(Matrix_2 [r+1] [c] == 0) { 
-						   (*(patch_stats + p)).Touch_border = 1; 
+						   (*(patch_stats2 + p)).Touch_border = 1; 
 						} 
 					} 
 				} 
@@ -873,7 +912,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 					out_pix++; 
 					Matrix_3 [r+2] [c+1] = 'C'; 
 					// Note the patches that touch the matrix border   
-					(*(patch_stats + p)).Touch_border = 1; 
+					(*(patch_stats2 + p)).Touch_border = 1; 
 				} 
 				look_left: 
 				// ensure not the matrix left edge  
@@ -896,7 +935,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 						} 
 						// if the cell at left is missing, code touch_border  
 						if(Matrix_2 [r] [c-1] == 0) { 
-						   (*(patch_stats + p)).Touch_border = 1; 
+						   (*(patch_stats2 + p)).Touch_border = 1; 
 						} 
 					} 
 				} 
@@ -907,23 +946,23 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 					out_pix++; 
 					Matrix_3 [r+1] [c] = 'C'; 
 					// Note the patches that touch the matrix border   
-					(*(patch_stats + p)).Touch_border = 1; 
+					(*(patch_stats2 + p)).Touch_border = 1; 
 				} 
 				goto look_up; 
 				done: 
 				test = 1; 
 			} // end of while loop  
 			// Save the patch perimeter, out_pixels, and max cols and rows   
-			(*(patch_stats + p)).Out_edges = out_edge; 
-			(*(patch_stats + p)).Out_pixels = out_pix; 
-			(*(patch_stats + p)).Row_max = r_max; 
-			(*(patch_stats + p)).Col_max = c_max; 
-			(*(patch_stats + p)).Col_min = c_min; 
+			(*(patch_stats2 + p)).Out_edges = out_edge; 
+			(*(patch_stats2 + p)).Out_pixels = out_pix; 
+//			(*(patch_stats + p)).Row_max = r_max; 
+//			(*(patch_stats + p)).Col_max = c_max; 
+//			(*(patch_stats + p)).Col_min = c_min; 
 			// Start peekinside routine  
 			//  First, note that no patch with size < 8 can have an interior, so set  
 			//    the statistics for those small ones here, and skip the peekinside routine 
-			if( (*(patch_stats + p)).Num_pixels < 8) { 
-				(*(patch_stats + p)).In_edges = 0; 
+			if( (*(patch_stats2 + p)).Num_pixels < 8) { 
+				(*(patch_stats2 + p)).In_edges = 0; 
 			} 
 			else { 
 				// Search for interior pixel: one enclosed by another patch   
@@ -1076,7 +1115,7 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 				//  Accumulate the counts for this patch, adding in the inclusion just completed  
 				sum_in_edges = sum_in_edges + edge_temp; 
 				// Update the number of inside pixels for patches of all sizes   
-				(*(patch_stats + p)).In_edges = sum_in_edges; 
+				(*(patch_stats2 + p)).In_edges = sum_in_edges; 
 				// return to the peekinside routine to search for next inclusion   
 				r = r_org;  // Go back to first column of current row   
 				c = c_min-1; 
@@ -1099,22 +1138,21 @@ void Patch_Analyzer_4neighbor(unsigned int nrows, unsigned int ncols)
 	return; 
 }  
 
-
-
-
-
-
-/* Patch_Analyzer_8neighbor:  */ 
-void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols) 
+/* Patch_Analyzer_1:  
+	Find the type, row origin, column origin, and bounding box for each patch.
+	Store results in structure patch_stats1.
+	This can be applied to both 4- and 8-neighbor patchmaps.
+*/ 
+void Patch_Analyzer_1(unsigned int nrows, unsigned int ncols) 
 { 
 	int p, r, c, cmin, cmax, rmin, rmax, test;
 	// the magic, see main 
 	unsigned char (*Matrix_1)[ncols] = (unsigned char (*)[ncols])mat_in;
 	unsigned int (*Matrix_2)[ncols] = (unsigned int (*)[ncols])mat_patnum;
 	cmin=0; cmax=0; rmax=0; rmin=0;
-	// Initialize the (*(patch_stats + patch)).Num_pixels counter  
+	// Initialize the (*(patch_stats1 + patch)).Num_pixels counter  
 	for(p = 0; p <= matrix_stats.Num_patches; p++) { 
-		(*(patch_stats + p)).Num_pixels = 0; 
+		(*(patch_stats1 + p)).Num_pixels = 0; 
 	} 
 	// Count the number of pixels in each patch, using patch number extracted 
 	//   from Matrix_2 as subscript.  Note that any missing cells have a 0  
@@ -1122,7 +1160,7 @@ void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols)
 	//   for which the subscripts start at base 1.        
 	for(r = 0; r < control.Rows; r++) { 
 		for (c = 0; c < control.Cols; c++) { 
-			(*(patch_stats + Matrix_2 [r] [c] )).Num_pixels++; 
+			(*(patch_stats1 + Matrix_2 [r] [c] )).Num_pixels++; 
 		} 
 	} 
 	// find the patch type and origin row and column
@@ -1132,7 +1170,7 @@ void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols)
 		//		patches start at the row of the preceding patch -- patch (p-1).
 		//		Note that the row_org for patch p-1 will be set by the time patch p is checked.
 		if(p > 1) {
-			r = (*(patch_stats + p - 1)).Row_org; 
+			r = (*(patch_stats1 + p - 1)).Row_org; 
 		} 
 		else { // Use the first row for the first patch 
 			r = 0; 
@@ -1145,9 +1183,9 @@ void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols)
 				else {
 					// The upper left pixel of patch p was found  
 					// Save the location and type  
-					(*(patch_stats + p)).Row_org = r;  // This is also Row_min 
-					(*(patch_stats + p)).Col_org = c; 
-					(*(patch_stats + p)).Patch_type = Matrix_1 [r] [c]; 
+					(*(patch_stats1 + p)).Row_org = r;  // This is also Row_min 
+					(*(patch_stats1 + p)).Col_org = c; 
+					(*(patch_stats1 + p)).Patch_type = Matrix_1 [r] [c]; 
 					goto breakout; 
 				}
 			} 
@@ -1160,9 +1198,9 @@ void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols)
 #pragma omp parallel  for  	 private ( p, rmin, rmax, cmin, cmax, c, r, test)		
 	for(p = 1; p <= matrix_stats.Num_patches; p++) { 
 		// check the remaining columns of row = rmin = row_org
-		rmin =(*(patch_stats + p)).Row_org; // row_org is by definition rmin
+		rmin =(*(patch_stats1 + p)).Row_org; // row_org is by definition rmin
 		rmax = rmin;
-		cmin = (*(patch_stats + p)).Col_org; // Col_org is the cmin within the first row of the patch
+		cmin = (*(patch_stats1 + p)).Col_org; // Col_org is the cmin within the first row of the patch
 		cmax = cmin;
 		// check the rest of the row for cmax
 		for(c = cmin+1; c < control.Cols; c++) {
@@ -1186,9 +1224,9 @@ void Patch_Analyzer_8neighbor(unsigned int nrows, unsigned int ncols)
 				}	
 			}
 		}
-		(*(patch_stats + p)).Row_max = rmax;
-		(*(patch_stats + p)).Col_max = cmax;
-		(*(patch_stats + p)).Col_min = cmin;	
+		(*(patch_stats1 + p)).Row_max = rmax;
+		(*(patch_stats1 + p)).Col_max = cmax;
+		(*(patch_stats1 + p)).Col_min = cmin;	
 	}
 	return; 
 }  
