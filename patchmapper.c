@@ -1192,6 +1192,7 @@ void Patch_Analyzer_1(unsigned int nrows, unsigned int ncols)
 			r++;   // continue with the next row  
 		}
 		breakout:
+		;
 	}
 	// find cmin, cmax, rmax for each patch
 // OMP over patches		
