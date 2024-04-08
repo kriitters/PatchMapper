@@ -54,7 +54,7 @@ Version 0.91  February 2024
 Added the accumulation and text export of individual patch statistics (size, class, location of patch origin)
 Version 0.9 October 2021
 Began re-construction of key capabilities from LandStat.c (ca 1991-1998), a program
-	that was used to calculate the landscape pattern metrics described in the appendix of
+	that was used to calculate thset e landscape pattern metrics described in the appendix of
 	Riitters et al 1995 (https://doi.org/10.1007/BF00158551). As implemented here, the metrics
 	may differ from the published versions. Important code changes include:
 	1. implementation of 8-neighbor connectivity in addition to 4-neighbor.
@@ -153,6 +153,7 @@ int main(int argc, char **argv)
 {
 	unsigned int row, col, nrows, ncols, index, ret_val, vold, vnew;
 	unsigned int dumint, ind1, counter, recode_table[256], temp_int;
+	unsigned long long int longindex;
 	unsigned int Out_to_in[256];      // Array(x) = internal code for external code x 
 	unsigned int In_to_out[256];      // Array(x) = external code for internal code x 
 	char filename_in[100], filename_siz[100], filename_par[100], filename_rec[100], 
@@ -202,10 +203,6 @@ int main(int argc, char **argv)
 	printf("\nAllocating memory for input data, patchmap, and utility matrix");
 	// mat_in is the input map 
 	if( (mat_in = (unsigned char *)calloc( (nrows * ncols), sizeof(unsigned char) ) ) == NULL ) {printf("\nMalloc failed, mat_in.\n");exit(20);}
-	// mat_patnum is the patch number map
-	if( (mat_patnum = (unsigned int *)calloc( (nrows * ncols), sizeof(unsigned int) ) ) == NULL ){printf("\nMalloc failed, mat_patnum.\n");exit(21);}
-	// mat_util is a utility matrix, note it's buffered by one pixel all around 
-	if( (mat_util = (unsigned char *)calloc( ((nrows+2) * (ncols+2)), sizeof(unsigned char) ) ) == NULL ) {printf("\nMalloc failed, mat_util.\n");exit(22);}
 	// read the input data
 	printf("\nReading %d columns and %d rows from file %s.", ncols, nrows, filename_in);
 	if(fread(mat_in, 1, (nrows * ncols), infile) != (nrows * ncols) ) {printf("\nError reading input map.\n"); free(mat_in); exit(23);}
@@ -226,15 +223,19 @@ int main(int argc, char **argv)
 			printf("\n   %8d ---> %3d", vold, vnew);
 		}
 		fclose(recfile);
+		printf("\nCheck 1");
+		longindex = nrows*ncols;
+		printf("\n Nrows * Ncols = %lld", longindex);
 // OMP the recode		
-#pragma omp parallel  for  	 private ( row, index, col, dumint)		
-		for (row=0; row < nrows; row++) {
-			index = row * ncols;
-			for (col=0; col < ncols; col++) {
-				dumint = *(mat_in + index + col);
-				*(mat_in + index + col) = recode_table[dumint];
-			}
-		}
+//#pragma omp parallel  for  	 private ( row, index, col, dumint)
+for(row = 0; row < nrows; row++){
+longindex = row * ncols;
+for (col = 0; col < ncols; col++){
+	dumint = (*(mat_in + longindex + col));
+	(*(mat_in + longindex + col)) = recode_table[dumint];
+}
+}
+printf("\nCheck 2");
 	}
 	// Recode input so that type codes start at zero and go 
 	//  to t-1 types, with missing values set to type code 255 
@@ -282,7 +283,11 @@ int main(int argc, char **argv)
 	for(ind1 = 0; ind1 < matrix_stats.Num_types; ind1++) {
 			printf("\n%4d %10d  %7.5f", In_to_out[ind1], matrix_stats.Pix_counts [ind1], matrix_stats.Pix_percents [ind1]);
 	}
-	// Identify the patches. 
+	// Identify the patches.
+	// mat_patnum is the patch number map
+	if( (mat_patnum = (unsigned int *)calloc( (nrows * ncols), sizeof(unsigned int) ) ) == NULL ){printf("\nMalloc failed, mat_patnum.\n");exit(21);}
+	// mat_util is a utility matrix, note it's buffered by one pixel all around 
+	if( (mat_util = (unsigned char *)calloc( ((nrows+2) * (ncols+2)), sizeof(unsigned char) ) ) == NULL ) {printf("\nMalloc failed, mat_util.\n");exit(22);}
 	printf("\nIdentifying patches with %d neighbor rule", parameters.neighbor_rule);
 	Patch_Definer(nrows, ncols);
 	// print n patches 
